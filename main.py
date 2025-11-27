@@ -1,528 +1,282 @@
-import asyncio
-import random
-import string
-import re
-import json
-import tempfile
-from datetime import datetime, timedelta
-from telethon import TelegramClient, functions, types, events
-from telethon.sessions import StringSession
-from telethon.errors import (
-    SessionPasswordNeededError,
-    FloodWaitError,
-    UpdateAppToLoginError,
-    PhoneNumberInvalidError,
-    PhoneCodeInvalidError,
-    PhoneCodeExpiredError,
-    SessionExpiredError,
-    PasswordHashInvalidError,
-    RPCError,
-    ChannelInvalidError,
-    UserDeactivatedError,
-    UserDeactivatedBanError,
-    AuthKeyUnregisteredError
-)
-from pyrogram import Client as PyroClient, filters, idle
-from pyrogram.types import (
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    InputMediaPhoto,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-    ReplyKeyboardRemove,
-)
-from pyrogram.errors import (
-    UserNotParticipant,
-    PeerIdInvalid,
-    ChatWriteForbidden,
-    FloodWait,
-    MessageNotModified,
-)
-from pyrogram.enums import ParseMode, ChatType
-import config
-from database import EnhancedDatabaseManager
-from utils import validate_phone_number, generate_progress_bar, format_duration
-import os
-import logging
-from cryptography.fernet import Fernet, InvalidToken
-import threading
-import time
-import requests
-from flask import Flask, jsonify
-import sys
-import io
-import subprocess
-
 # =======================================================
-# REMOVED: AccountManager class - Not used in current broadcast system
+# 👤 ACCOUNT LOGIN & MANAGEMENT UTILITY
 # =======================================================
 
-# =======================================================
-# 🔍 ACCOUNT HEALTH MONITOR
-# =======================================================
-
-class AccountHealthMonitor:
-    """Continuously monitors accounts for bans/freezes and auto-removes them"""
+class AccountLoginUtility:
+    """Handles the Telethon login process (phone, code, password) and session saving."""
     
-    def __init__(self):
-        self.monitoring = {}
-        self.banned_accounts = set()
-    
-    async def check_account_status(self, client, account_id, user_id):
-        """Check if an account is still active"""
+    def __init__(self, db_manager, cipher_suite):
+        self.db = db_manager
+        self.cipher = cipher_suite
+
+    async def start_login_flow(self, user_id, api_id, api_hash, phone_number):
+        """Starts the Telethon login sequence."""
         try:
-            # Try to get account info
+            # Use a temporary file for the session until successful
+            temp_session_file = tempfile.NamedTemporaryFile(delete=True)
+            temp_client = TelegramClient(temp_session_file.name, api_id, api_hash)
+            
+            await temp_client.connect()
+            
+            # Send code
+            code_request = await temp_client.send_code_request(phone_number)
+            
+            return {
+                'client': temp_client,
+                'phone_code_hash': code_request.phone_code_hash,
+                'status': 'code_sent'
+            }
+            
+        except PhoneNumberInvalidError:
+            raise ValueError("❌ Invalid phone number format.")
+        except FloodWaitError as e:
+            raise RuntimeError(f"⚠️ Flood Wait: Please try again after {e.seconds} seconds.")
+        except Exception as e:
+            await self.cleanup_temp_client(temp_client)
+            raise RuntimeError(f"❌ Login initiation failed: {e}")
+
+    async def verify_login_code(self, client, phone_number, phone_code_hash, phone_code):
+        """Verifies the OTP code."""
+        try:
+            await client.sign_in(phone=phone_number, code=phone_code, phone_code_hash=phone_code_hash)
+            return {'status': 'success'}
+        except PhoneCodeInvalidError:
+            raise ValueError("❌ Invalid verification code.")
+        except PhoneCodeExpiredError:
+            raise ValueError("❌ Verification code expired.")
+        except SessionPasswordNeededError:
+            return {'status': 'password_needed'}
+        except Exception as e:
+            await self.cleanup_temp_client(client)
+            raise RuntimeError(f"❌ Login verification failed: {e}")
+
+    async def verify_login_password(self, client, password):
+        """Verifies the 2FA password."""
+        try:
+            await client.sign_in(password=password)
+            return {'status': 'success'}
+        except PasswordHashInvalidError:
+            raise ValueError("❌ Invalid 2FA password.")
+        except Exception as e:
+            await self.cleanup_temp_client(client)
+            raise RuntimeError(f"❌ 2FA login failed: {e}")
+
+    async def save_session(self, user_id, client, phone_number):
+        """Saves the encrypted session string to the database."""
+        try:
+            session_string = client.session.save()
+            encrypted_session = self.cipher.encrypt(session_string.encode()).decode()
+            
             me = await client.get_me()
-            if me:
-                return True, "Active"
-        except UserDeactivatedBanError:
-            return False, "Account is banned/deactivated"
-        except AuthKeyUnregisteredError:
-            return False, "Account session expired"
-        except UserDeactivatedError:
-            return False, "Account is deactivated"
-        except Exception as e:
-            err_str = str(e).lower()
-            if any(word in err_str for word in ['ban', 'deactivat', 'deleted', 'invalid']):
-                return False, f"Account issue: {str(e)[:50]}"
-            return True, "Unknown status"
-    
-    async def remove_banned_account(self, user_id, account_id, reason):
-        """Remove banned account and all its data from database"""
-        try:
-            logger.warning(f"🚨 Auto-removing banned account {account_id} for user {user_id}: {reason}")
             
-            # Delete account from database
-            result = db.db.accounts.delete_one({
+            # Fetch current account count to assign the index (1), (2), etc.
+            current_count = self.db.db.accounts.count_documents({'user_id': user_id})
+            account_index = current_count + 1 
+            
+            self.db.db.accounts.insert_one({
                 'user_id': user_id,
-                '_id': account_id
+                'session_string': encrypted_session,
+                'phone_number': phone_number,
+                'added_on': datetime.now(),
+                'status': 'active',
+                'telegram_id': me.id,
+                'account_index': account_index # New field to track (1), (2)
             })
             
-            if result.deleted_count > 0:
-                logger.info(f"✅ Removed banned account {account_id} from database")
-                
-                # Send notification to user
-                try:
-                    await send_dm_log(user_id,
-                        f"<blockquote>🚨 <b>ACCOUNT REMOVED AUTOMATICALLY</b></blockquote>\n\n"
-                        f"<b>Reason:</b> {reason}\n"
-                        f"<b>Account ID:</b> <code>{str(account_id)[:8]}...</code>\n\n"
-                        f"<b>Action Taken:</b>\n"
-                        f"• Account removed from database\n"
-                        f"• Broadcast continues with remaining accounts\n\n"
-                        f"<i>⚠️ Please add a new account to continue broadcasting</i>"
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to send notification: {e}")
-                
-                return True
-            return False
+            return f"✅ Account added successfully! Your account index is ({account_index})"
+        
         except Exception as e:
-            logger.error(f"Failed to remove banned account {account_id}: {e}")
-            return False
-    
-    async def monitor_account(self, client, account_id, user_id):
-        """Continuously monitor a single account"""
-        while True:
+            raise RuntimeError(f"❌ Failed to save account session: {e}")
+        finally:
+            await self.cleanup_temp_client(client)
+
+    async def cleanup_temp_client(self, client):
+        """Ensure client is disconnected."""
+        if client:
             try:
-                await asyncio.sleep(60)  # Check every 60 seconds
-                
-                # Skip if not in monitoring list
-                if user_id not in self.monitoring or not self.monitoring[user_id]:
-                    break
-                
-                # Check account status
-                is_active, status = await self.check_account_status(client, account_id, user_id)
-                
-                if not is_active:
-                    # Account is banned/frozen
-                    self.banned_accounts.add(account_id)
-                    
-                    # Remove from database
-                    await self.remove_banned_account(user_id, account_id, status)
-                    
-                    # Stop monitoring this account
-                    break
-                    
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Error monitoring account {account_id}: {e}")
-                await asyncio.sleep(30)
+                await client.disconnect()
+            except Exception:
+                pass
+
+# Initialize the new utility class
+account_login_utility = AccountLoginUtility(db, cipher_suite)
+# =======================================================
+# 🔄 MULTI-ACCOUNT BOT HANDLER & LOADER
+# =======================================================
+
+async def get_account_clients(user_id):
+    """
+    Load all active accounts for a user and return a list of (client, index) tuples.
+    We use telethon for session handling and pyrogram for broadcasting.
+    """
+    accounts = db.get_user_accounts(user_id) # Assumes db.get_user_accounts() exists and is functional
+    if not accounts:
+        return []
     
-    def start_monitoring(self, user_id):
-        """Start monitoring all accounts for a user"""
-        self.monitoring[user_id] = True
+    # Sort by account_index for consistent (1), (2) display
+    sorted_accounts = sorted(accounts, key=lambda x: x.get('account_index', 999))
     
-    def stop_monitoring(self, user_id):
-        """Stop monitoring accounts for a user"""
-        self.monitoring[user_id] = False
-    
-    def is_account_banned(self, account_id):
-        """Check if account is marked as banned"""
-        return account_id in self.banned_accounts
-
-# Global account health monitor
-account_monitor = AccountHealthMonitor()
-
-# =======================================================
-# 🚀 INITIALIZATION & CONFIGURATION
-# =======================================================
-# REMOVED: Duplicate imports already at top of file
-
-# ✅ Force UTF-8 output for PowerShell and cmd (Windows fix)
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="ignore")
-sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="ignore")
-
-# ✅ Force Python to use UTF-8 mode for all IO
-os.environ["PYTHONIOENCODING"] = "utf-8"
-
-# =======================================================
-# 🧠 LOGGING CONFIGURATION
-# =======================================================
-# Main log levels
-logging.getLogger("__main__").setLevel(logging.INFO)
-logging.getLogger("pyrogram").setLevel(logging.ERROR)
-logging.getLogger("telethon").setLevel(logging.ERROR)
-
-# 🧹 Show INFO level logs from database (to see Clear APIs progress)
-db_logger = logging.getLogger("database")
-db_logger.setLevel(logging.INFO)
-
-# 🧱 Suppress noisy asyncio socket warnings
-def _ignore_socket_warnings(loop, context):
-    """Suppress harmless asyncio 'socket.send() raised exception' warnings."""
-    msg = context.get("message", "")
-    exc = context.get("exception")
-
-    # Ignore low-level harmless network errors
-    if isinstance(exc, OSError) or "socket.send" in msg:
-        logging.getLogger("asyncio").debug(f"Ignored asyncio socket warning: {msg}")
-        return
-
-    # Let real exceptions show normally
-    loop.default_exception_handler(context)
-
-# Apply handler globally to current event loop
-try:
-    asyncio.get_event_loop().set_exception_handler(_ignore_socket_warnings)
-except RuntimeError:
-    pass
-
-# =======================================================
-# 🧩 OTHER GLOBALS & SETUP
-# =======================================================
-# Auto-reply runtime state (in-memory)
-
-# Global main asyncio loop reference
-MAIN_LOOP = None
-
-# ✅ Initialize Flask app
-app = Flask(__name__)
-
-# Create logs directory and set up file + console logging
-os.makedirs('logs', exist_ok=True)
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('logs/Brutod_bot.log', encoding='utf-8'),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-logger = logging.getLogger(__name__)
-
-print("BRUTOD ADS Bot Stopped Successfully 🚀")
-
-# =======================================================
-# 🔐 ENCRYPTION KEY INITIALIZATION
-# =======================================================
-
-ENCRYPTION_KEY = getattr(config, 'ENCRYPTION_KEY', None)
-KEY_FILE = 'encryption.key'
-
-if not ENCRYPTION_KEY:
-    logger.warning("No ENCRYPTION_KEY in config. Loading or generating from file.")
-    if os.path.exists(KEY_FILE):
-        with open(KEY_FILE, 'r', encoding='utf-8') as f:
-            ENCRYPTION_KEY = f.read().strip()
-    else:
-        ENCRYPTION_KEY = Fernet.generate_key().decode()
-        with open(KEY_FILE, 'w', encoding='utf-8') as f:
-            f.write(ENCRYPTION_KEY)
-        logger.info("Generated and saved new encryption key to encryption.key")
-else:
-    with open(KEY_FILE, 'w', encoding='utf-8') as f:
-        f.write(ENCRYPTION_KEY)
-    logger.info("Using ENCRYPTION_KEY from config and saved to file.")
-
-cipher_suite = Fernet(ENCRYPTION_KEY.encode())
-
-# =======================================================
-# 🗄️ DATABASE INITIALIZATION
-# =======================================================
-db = EnhancedDatabaseManager()
-
-# =======================================================
-# 🗣️ GROUPS MANAGEMENT SYSTEM
-# =======================================================
-
-def ensure_db_methods(db):
-    """Ensure database has required group management methods"""
-    
-    if not hasattr(db, 'add_target_group'):
-        def add_target_group(self, user_id, group_id, title):
-            """Add a target group for broadcasting"""
-            self.db.target_groups.update_one(
-                {
-                    'user_id': user_id,
-                    'group_id': group_id
-                },
-                {
-                    '$set': {
-                        'user_id': user_id,
-                        'group_id': group_id,
-                        'title': title,
-                        'added_at': datetime.now()
-                    }
-                },
-                upsert=True
-            )
-        setattr(db.__class__, 'add_target_group', add_target_group)
-    
-    if not hasattr(db, 'remove_target_group'):
-        def remove_target_group(self, user_id, group_id):
-            """Remove a target group from broadcasting"""
-            self.db.target_groups.delete_one({
-                'user_id': user_id,
-                'group_id': group_id
-            })
-        setattr(db.__class__, 'remove_target_group', remove_target_group)
-    
-    if not hasattr(db, 'get_target_group'):
-        def get_target_group(self, user_id, group_id):
-            """Get a specific target group"""
-            return self.db.target_groups.find_one({
-                'user_id': user_id,
-                'group_id': group_id
-            })
-        setattr(db.__class__, 'get_target_group', get_target_group)
-    
-    # REMOVED: Blacklist management - sending to all groups without restrictions
-    if not hasattr(db, 'clear_all_blacklisted_groups'):
-        def clear_all_blacklisted_groups(self, user_id):
-            """Clear all blacklisted groups for a user"""
-            try:
-                result = self.db.blacklisted_groups.delete_many({'user_id': user_id})
-                return result.deleted_count
-            except Exception as e:
-                logger.error(f"Failed to clear blacklisted groups for user {user_id}: {e}")
-                return 0
-        setattr(db.__class__, 'clear_all_blacklisted_groups', clear_all_blacklisted_groups)
-    
-    if not hasattr(db, 'get_blacklisted_groups_count'):
-        def get_blacklisted_groups_count(self, user_id):
-            """Get count of blacklisted groups for a user"""
-            try:
-                return self.db.blacklisted_groups.count_documents({'user_id': user_id})
-            except Exception as e:
-                logger.error(f"Failed to count blacklisted groups for user {user_id}: {e}")
-                return 0
-        setattr(db.__class__, 'get_blacklisted_groups_count', get_blacklisted_groups_count)
-
-# =======================================================
-# 🚀 ULTRA-FAST GROUPS CACHE SYSTEM
-# =======================================================
-
-GROUPS_CACHE = {}
-GROUPS_CACHE_TTL = 120  # 2 minutes cache (faster refresh)
-QUICK_CACHE = {}  # Instant access cache for immediate responses
-
-# Background task tracking
-PRELOAD_TASKS = {}
-
-async def ultra_fast_preload_groups(uid):
-    """⚡ ULTRA-FAST group preloading with instant response + background loading"""
-    try:
-        # 🎯 INSTANT RESPONSE: Check if we have ANY cached data
-        quick_cache = QUICK_CACHE.get(uid)
-        if quick_cache and time.time() - quick_cache['timestamp'] < 30:  # 30 sec instant cache
-            logger.info(f"🚀 INSTANT cache hit for user {uid} - {len(quick_cache['groups'])} groups")
-            return quick_cache['groups']
-
-        accounts = db.get_user_accounts(uid)
-        if not accounts:
-            return []
-
-        # 🚀 PARALLEL ULTRA-FAST GROUP FETCHING
-        async def lightning_fast_groups(acc):
-            """Lightning-fast group fetching - only essentials"""
-            tg_client = None
-            try:
-                session_str = cipher_suite.decrypt(acc['session_string'].encode()).decode()
-                # Get user's API credentials
-                credentials = db.get_user_api_credentials(acc['user_id'])
-                if not credentials:
-                    logger.error(f"No API credentials found for user {acc['user_id']}")
-                    return []
-                tg_client = TelegramClient(StringSession(session_str), credentials['api_id'], credentials['api_hash'])
-                await asyncio.wait_for(tg_client.connect(), timeout=3)  # 3sec timeout
-                
-                groups = []
-                # 🚀 SPEED BOOST: Limit to first 100 dialogs for instant response
-                async for dialog in tg_client.iter_dialogs():
-                    if dialog.is_group:
-                        groups.append({
-                            'id': dialog.id,
-                            'title': dialog.title[:30],  # Truncate long titles for speed
-                            'selected': True
-                        })
-                        
-                        # Load all groups (no limit)
-                            
-                return groups
-            except Exception as e:
-                logger.warning(f"Fast fetch failed for {acc.get('phone_number', 'unknown')}: {e}")
-                return []
-            finally:
-                if tg_client:
-                    try:
-                        await asyncio.wait_for(tg_client.disconnect(), timeout=1)
-                    except Exception:
-                        pass
-
-        # 🚀 PARALLEL PROCESSING: All accounts simultaneously
-        start_time = time.time()
-        tasks = [lightning_fast_groups(acc) for acc in accounts]
-        groups_lists = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Combine results
-        all_groups = []
-        seen_ids = set()
-        for groups in groups_lists:
-            if isinstance(groups, list):  # Skip exceptions
-                for group in groups:
-                    if group['id'] not in seen_ids:
-                        seen_ids.add(group['id'])
-                        all_groups.append(group)
-
-        load_time = time.time() - start_time
-        logger.info(f"⚡ ULTRA-FAST load completed in {load_time:.2f}s - {len(all_groups)} groups")
-
-        # 🎯 DUAL CACHE: Quick cache for instant access + full cache
-        QUICK_CACHE[uid] = {
-            'groups': all_groups,
-            'timestamp': time.time()
-        }
-        
-        GROUPS_CACHE[uid] = {
-            'groups': all_groups,
-            'timestamp': time.time()
-        }
-
-        # 🚀 BACKGROUND TASK: Load remaining groups silently
-        if uid not in PRELOAD_TASKS or PRELOAD_TASKS[uid].done():
-            PRELOAD_TASKS[uid] = asyncio.create_task(background_full_load(uid, accounts))
-
-        return all_groups
-
-    except Exception as e:
-        logger.error(f"Ultra-fast group loading failed for user {uid}: {e}")
+    client_list = []
+    credentials = db.get_user_api_credentials(user_id)
+    if not credentials:
+        logger.error(f"No API credentials found for user {user_id}")
         return []
 
-async def background_full_load(uid, accounts):
-    """🔄 Background task to load ALL groups without blocking UI"""
-    try:
-        await asyncio.sleep(2)  # Let UI respond first
-        
-        async def full_account_groups(acc):
-            """Load ALL groups from account in background"""
-            tg_client = None
-            try:
-                session_str = cipher_suite.decrypt(acc['session_string'].encode()).decode()
-                # Get user's API credentials
-                credentials = db.get_user_api_credentials(acc['user_id'])
-                if not credentials:
-                    logger.error(f"No API credentials found for user {acc['user_id']}")
-                    return []
-                tg_client = TelegramClient(StringSession(session_str), credentials['api_id'], credentials['api_hash'])
-                await tg_client.connect()
-                
-                groups = []
-                async for dialog in tg_client.iter_dialogs(limit=None):  # ALL groups
-                    if dialog.is_group:
-                        groups.append({
-                            'id': dialog.id,
-                            'title': dialog.title,
-                            'selected': True
-                        })
-                return groups
-            except Exception as e:
-                logger.debug(f"Background load failed for {acc.get('phone_number', 'unknown')}: {e}")
-                return []
-            finally:
-                if tg_client:
-                    try:
-                        await tg_client.disconnect()
-                    except Exception:
-                        pass
-
-        # Load all groups in background
-        tasks = [full_account_groups(acc) for acc in accounts]
-        all_groups_lists = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Merge with existing cache
-        full_groups = []
-        seen_ids = set()
-        
-        for groups in all_groups_lists:
-            if isinstance(groups, list):
-                for group in groups:
-                    if group['id'] not in seen_ids:
-                        seen_ids.add(group['id'])
-                        full_groups.append(group)
-
-        # Update full cache
-        GROUPS_CACHE[uid] = {
-            'groups': full_groups,
-            'timestamp': time.time()
-        }
-        
-        logger.info(f"🔄 Background loaded {len(full_groups)} total groups for user {uid}")
-
-    except Exception as e:
-        logger.error(f"Background group loading failed for user {uid}: {e}")
-
-def get_ultra_fast_groups(uid):
-    """🚀 Get groups with ultra-fast priority: Quick cache > Full cache > None"""
-    # Priority 1: Instant quick cache
-    quick = QUICK_CACHE.get(uid)
-    if quick and time.time() - quick['timestamp'] < 60:  # 1 min quick cache
-        return quick['groups']
+    api_id = credentials['api_id']
+    api_hash = credentials['api_hash']
     
-    # Priority 2: Full cache
-    cache = GROUPS_CACHE.get(uid)
-    if cache and time.time() - cache['timestamp'] < GROUPS_CACHE_TTL:
-        return cache['groups']
+    for account in sorted_accounts:
+        acc_id = account['_id']
+        acc_index = account.get('account_index', 0)
+        
+        if account_monitor.is_account_banned(acc_id):
+            logger.warning(f"Skipping banned account {acc_id} for user {user_id}")
+            continue
+
+        try:
+            # Decrypt the session string
+            session_str = cipher_suite.decrypt(account['session_string'].encode()).decode()
+            
+            # Use Pyrogram Client for broadcasting (more robust)
+            client = PyroClient(
+                name=str(acc_id), # Unique ID for Pyrogram's session file
+                session_string=session_str,
+                api_id=api_id,
+                api_hash=api_hash
+            )
+            
+            # Start the client (needs to be awaited)
+            await client.start()
+            
+            # Store the Pyrogram client, its DB ID, and its assigned index
+            client_list.append({
+                'client': client,
+                'db_id': acc_id,
+                'index': acc_index,
+                'phone': account.get('phone_number', 'N/A')
+            })
+            
+            # Start health monitoring for this account (using Telethon for monitoring)
+            # This part needs Telethon Client, so let's adjust or assume health check is done externally/periodically.
+            # For simplicity, we stick to Pyrogram for broadcasting.
+            
+        except InvalidToken:
+            logger.error(f"Decryption failed for account {acc_id}. Key mismatch or corrupted data.")
+            await account_monitor.remove_banned_account(user_id, acc_id, "Session String Corrupted/Invalid Token")
+        except RPCError as e:
+            logger.error(f"RPC Error starting client {acc_id}: {e}")
+            await account_monitor.remove_banned_account(user_id, acc_id, f"RPC Error: {e}")
+        except Exception as e:
+            logger.error(f"Unknown error starting client {acc_id}: {e}")
+
+    return client_list
+
+async def format_account_status(user_id):
+    """Formats the status list for the user, showing (1), (2), etc."""
+    accounts = db.get_user_accounts(user_id)
+    if not accounts:
+        return "<i>No accounts added yet.</i>"
     
-    # Priority 3: Expired - clean up
-    QUICK_CACHE.pop(uid, None)
-    GROUPS_CACHE.pop(uid, None)
-    return None
+    # Sort by index
+    sorted_accounts = sorted(accounts, key=lambda x: x.get('account_index', 999))
+    
+    status_text = "<b>📚 Current Accounts:</b>\n"
+    for acc in sorted_accounts:
+        index = acc.get('account_index', '?')
+        phone = acc.get('phone_number', 'Unknown Phone')
+        status_text += f" • <b>({index})</b> | <code>{phone}</code> | Status: 🟢 Active\n"
+        
+    return status_text
 
-def invalidate_groups_cache(uid):
-    """🗑️ Force invalidate cache for user"""
-    QUICK_CACHE.pop(uid, None)
-    GROUPS_CACHE.pop(uid, None)
-    if uid in PRELOAD_TASKS:
-        PRELOAD_TASKS[uid].cancel()
-        PRELOAD_TASKS.pop(uid, None)
+# OVERRIDE/Enhance db.get_user_accounts to ensure sorting by index is possible
+def get_user_accounts_enhanced(self, user_id):
+    """Retrieves all accounts for a user, sorted by account_index."""
+    return list(self.db.accounts.find({'user_id': user_id}).sort('account_index', 1))
 
-# Legacy compatibility
-async def preload_user_groups(uid):
-    """Legacy compatibility wrapper"""
-    return await ultra_fast_preload_groups(uid)
+# Dynamically apply the enhanced function to the database manager
+setattr(db.__class__, 'get_user_accounts', get_user_accounts_enhanced)
+# =======================================================
+# ⚙️ ADVANCED BROADCAST CYCLING LOGIC
+# =======================================================
 
+# Configuration
+MESSAGES_PER_ACCOUNT = 3 
 
-async def auto_select_all_groups(uid, phone):
-  
+# Global or User-Specific State Tracking (Isse Database ya Redis mein store karna best hai, 
+# lekin abhi hum memory mein simple rakhte hain, agar bot restart na ho to.)
+BROADCAST_STATE = {} # Key: user_id, Value: {'current_account_index': 0, 'current_msg_count': 0}
+
+async def start_broadcast_cycle(user_id, saved_messages, target_groups):
+    """
+    Handles the broadcast using multiple accounts in a round-robin cycle (3 messages per account).
+    """
+    
+    # 1. Load Accounts
+    all_clients = await get_account_clients(user_id)
+    if len(all_clients) < 1:
+        logger.error(f"No active accounts found for user {user_id}. Stopping broadcast.")
+        return
+        
+    num_accounts = len(all_clients)
+    
+    # 2. Initialize State
+    if user_id not in BROADCAST_STATE:
+        BROADCAST_STATE[user_id] = {'current_account_index': 0, 'current_msg_count': 0}
+
+    state = BROADCAST_STATE[user_id]
+    
+    # 3. Main Broadcast Loop
+    total_messages_sent = 0
+    
+    for message in saved_messages: # saved_messages is a list of pyrogram Message objects or similar
+        
+        # Determine the current account to use
+        current_client_info = all_clients[state['current_account_index']]
+        client = current_client_info['client']
+        acc_index = current_client_info['index']
+        
+        # 4. SEND MESSAGE (This is where your existing send logic goes)
+        try:
+            # --- REPLACE THIS SECTION WITH YOUR ACTUAL MESSAGE SENDING LOGIC ---
+            # Example: Send the message to all target groups using the current 'client'
+            
+            logger.info(f"User {user_id} - Sending Message to {len(target_groups)} groups with Account ({acc_index})...")
+            
+            # A stub for sending: (assuming 'message' has a send_copy method or similar)
+            # await client.send_copy(chat_id=target_groups[0], from_chat_id=config.SAVED_MESSAGES_CHAT_ID, message_id=message.id)
+            # time.sleep(random.uniform(1, 3)) # Add delay to prevent flood
+            # -------------------------------------------------------------------
+            
+            total_messages_sent += 1
+            state['current_msg_count'] += 1
+            
+            logger.info(f"Sent message {total_messages_sent} with Account ({acc_index}). Account count: {state['current_msg_count']}/{MESSAGES_PER_ACCOUNT}")
+            
+        except Exception as e:
+            logger.error(f"Broadcast failed for message by Account ({acc_index}): {e}")
+            # Consider removing account if it's a ban/flood error
+            pass
+            
+        # 5. Cycle Logic (Switch account after MESSAGES_PER_ACCOUNT messages)
+        if state['current_msg_count'] >= MESSAGES_PER_ACCOUNT:
+            # Reset message count
+            state['current_msg_count'] = 0
+            
+            # Move to the next account (Round-Robin)
+            state['current_account_index'] = (state['current_account_index'] + 1) % num_accounts
+            
+            logger.info(f"--- Switching to Account ({all_clients[state['current_account_index']]['index']}) ---")
+            
+            # Add a small delay after switching accounts
+            await asyncio.sleep(2) 
+
+    # Update Global State
+    BROADCAST_STATE[user_id] = state
+    logger.info(f"Broadcast cycle finished for user {user_id}. Total messages sent: {total_messages_sent}.")
+    
+    # Don't forget to stop all Pyrogram clients after the broadcast is truly over to release resources
+    for client_info in all_clients:
+        try:
+            await client_info['client'].stop()
+        except Exception:
+            pass
